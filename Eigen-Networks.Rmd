@@ -1,0 +1,299 @@
+---
+title: "Eigen-Networks"
+author: "PS STUMPF"
+date: "22/01/2019"
+output: html_document
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, error=FALSE, warning=FALSE, cache=TRUE, auto.dep=TRUE, echo=TRUE, tidy=FALSE, width.cutoff=50, fig.width = 4, fig.asp = 1)
+options(digits=6)
+
+suppressPackageStartupMessages({
+  library(marray)
+  library(mclust)
+  library(flowCore)
+  library(flowViz)
+  library(beanplot)
+})
+
+# specific hexbin plot function
+source('./hexpress.R')
+```
+
+This markdown file contains source code related to Stumpf & MacArthur *Machine learning of stem cell identities from single-cell expression data via regulatory network archetypes*. Frontiers in Genetics 10:2 (2019) https://doi.org/10.3389/fgene.2019.00002
+
+Please cite this paper if you re-use any of the code below.
+
+## Load and transform CyTOF data
+
+Load regulatory network (manually curated using the ChIP-Seq database ChIPBasev2.0 and KEGG).
+
+```{r load_adjacency_matrices}
+IRN <- read.table('./RegulatoryNetwork', header=T, sep="\t", stringsAsFactors = FALSE)
+colix <- unique(c(IRN$Source.Index, IRN$Target.Index))
+```
+
+Load CyTOF data from Zunder et al. (2015) Cell Stem Cell doi: 10.1016/j.stem.2015.01.015. (cytobank accession: 43324).
+
+Data contains 47 features (including 6 condition barcodes, some DNA markers etc.).
+
+```{r load_expression_data, results='hide', warning=FALSE}
+mESC.NG <- read.flowSet(path='./cytobank43324/', pattern='NG')
+```
+
+Perform logicle transformation on data.
+
+```{r transform_data}
+# create transformation function with parameters
+lgcl  <- logicleTransform(w = 0.6, t = 10000, m = 4.5)
+# create transformList to apply to non-linear features
+trans <- transformList(parameters(mESC.NG[[1]])$name[9:46], lgcl)
+# apply transformation
+mESC.NG <- transform(mESC.NG, trans)
+```
+
+## Eigen-networks
+
+Integrate single-cell expression data with regulatory network. Derived expression values can be regarded as the edge-expression of the regulatory network.
+
+```{r scIRN, eval=TRUE}
+# Apply function(X) to each frameset and apply function(x) to each row. Returns a list
+IRN.NG <- fsApply(mESC.NG,
+                  function(X){ apply(exprs(X), # expression values of cells in flowFrame X
+                                     1,        # work along first dimenions (one row [cell] at a time)
+                                     function(x){ x[IRN$Source.Index] * (x[IRN$Target.Index] ^ IRN$Sign)  }) },
+                  simplify = F)
+```
+
+Obtain regulatory network archetypes (aka Eigen-Networks, aka principal components). Run *prcomp* on regulatory network data in 0i conditions, project all other conditions.
+
+```{r PCA_spIRN_2iprojectElse, eval=TRUE}
+# Run prcomp to obtain principal components
+pcEdge0i <- prcomp(t(IRN.NG$'NG_CGR8-2i.fcs'), center=T, scale.=T)
+```
+
+Calculate the proportion of variance explained.
+
+```{r screeplot, fig.width = 4, fig.asp = 1}
+VarExpl <- (pcEdge0i$sdev^2) / sum(pcEdge0i$sdev^2)
+
+# Screeplot
+par(mar=c(4,4,.5,.5))
+plot(cumsum(VarExpl), type='l', ylim=c(0,1), las=1,
+     xlab='Component', ylab='Variance Explained', bty='n'); abline(h=0.95, lty=2, col=2)
+```
+
+Function to project unseen data onto principal components.
+
+```{r predictPCA}
+# Function predictPCA()
+predictPCA <- function(object, newdata, cmpnts=1:3)  {
+  # function to project newdata onto principal components (object)
+  # newdata: matrix with samples (rows) and features (columns)
+  predictNewData <- apply(newdata, 2, function(iSample) { ((iSample - object$center) / object$scale) %*% object$rotation[,cmpnts] })
+  return(t(predictNewData))
+}
+```
+
+Extract data of choice and project in principal component space of mESC.NG in 0i conditions.
+
+```{r extractAndProject}
+# specify PCs
+pcomp = 1:2
+# extract expression matrix (select flowFrame of choice, for instance 2i)
+exprmat <- exprs(mESC.NG$'NG_CGR8-2i.fcs')
+# project data (select corresponding integrated regulatory network of choice)
+xy <- predictPCA(pcEdge0i, IRN.NG$'NG_CGR8-2i.fcs', cmpnts = pcomp)
+colnames(xy) <- colnames(pcEdge0i$x[,pcomp])
+```
+
+Calculate density of cells in principal component space and visualise using hexbin.
+
+```{r hexbinDensity}
+hexpress(xy=xy, exprmat=exprmat, feats='density', pcomp=1:2)
+```
+
+Calculate overall expression and visualise using hexbin.
+
+```{r hexbinOverall}
+hexpress(xy=xy, exprmat=exprmat, feats='overall', pcomp=1:2, colix=colix)
+```
+
+Display node expression using hexbin.
+
+```{r hexbinPCexprmat}
+hexpress(xy=xy, exprmat=exprmat, feats='Nanog(Gd156)Dd', pcomp=1:2)
+```
+
+Display color bar.
+
+```{r hexbinColorbar, fig.width = 3, fig.asp = 1}
+col <- maPalette(low = 'blue', high = 'green', k = 11)
+
+par(mar=c(3 ,7, 3, 7))
+  image(t(as.matrix(1:11)), col=col, axes=F)
+  axis(4, at = c(0,1),labels = c('low','high'),line = 0.25, las=1)
+  mtext(side=2, text='Expression',line = 0.5)
+```
+
+
+## Classification and surprisal analysis
+
+```{r LoadPreviousData, eval=TRUE, echo=FALSE, cache.lazy=FALSE}
+# Load data when knitting markdown
+load(file = '../../Single Cell Networks Rnalyses/CyTOF/Mclust-GMM-Revised.RData')
+load(file = '../../Single Cell Networks Rnalyses/CyTOF/Mclust-Density-Revised.RData')
+load(file = '../../Single Cell Networks Rnalyses/CyTOF/Mclust-Classification-Revised.RData')
+```
+
+Fit multivariate Gaussian Mixture Model (GMM) with unconstrained co-variance.
+
+```{r Mclust3D_gmm, eval=F}
+# Fit multivariate gaussian mixture model
+xyzMc <- Mclust(pcEdge0i$x[,1:3], G=4, modelNames = 'VVV')
+# obtain density
+xyzMc.density <- densityMclust(pcEdge0i$x[,1:3], G=4, modelNames = 'VVV')
+```
+
+Display total variance.
+
+```{r TotalVariance, fig.width = 4, fig.asp = 1}
+# total variance (trace of covariance matrix + and sum of across remaining off-diagona covariance matrix)
+GMMvar <- rbind( apply(xyzMc$parameters$variance$sigma, 3,
+                       function(x){sum(diag(x))}),
+                 apply(xyzMc$parameters$variance$sigma, 3, 
+                       function(x){sum(abs(x))}) - apply(xyzMc$parameters$variance$sigma, 3,
+                                                         function(x){sum(diag(x))})
+                 )[,c(3,1,2,4)]
+rownames(GMMvar) <- c('Trace','OffDiagonal')
+
+# Plot results
+par(mar=c(4,4,.5,.5))
+barplot(GMMvar, las=1, names=1:4, xlab='Cluster', ylab='Total Variance')
+```
+
+Calculate centroid Eigen-Network for each cluster and export for external visualisation (e.g. using Cytoscape or yEd). See figure 4B in Stumpf & MacArthur (2019).
+
+```{r CentroidEigenNetwork, eval=F}
+# prepare data for export 1/3
+clusterface <- cbind(( pcEdge0i$center + pcEdge0i$scale * t(xyzMc$parameters$mean[,1] %*% t(pcEdge0i$rotation[,1:3])) ),
+                     ( pcEdge0i$center + pcEdge0i$scale * t(xyzMc$parameters$mean[,2] %*% t(pcEdge0i$rotation[,1:3])) ),
+                     ( pcEdge0i$center + pcEdge0i$scale * t(xyzMc$parameters$mean[,3] %*% t(pcEdge0i$rotation[,1:3])) ),
+                     ( pcEdge0i$center + pcEdge0i$scale * t(xyzMc$parameters$mean[,4] %*% t(pcEdge0i$rotation[,1:3])) ))
+colnames(clusterface) <- c('centroid-c1', 'centroid-c2', 'centroid-c3', 'centroid-c4')
+rownames(clusterface) <- c()
+# prepare data for export 2/3
+pcexport <- cbind(pcEdge0i$center, pcEdge0i$scale)
+colnames(pcexport) <- c('center', 'scale')
+# prepare data for export 3/3
+pcexport <- cbind(pcexport, pcEdge0i$rotation)
+rownames(pcexport) <- c()
+
+# write matrix for network
+write.table(cbind(IRN, clusterface, pcexport),
+                  file='IRN-NG.tgf', sep='\t', quote=F, row.names = F, col.names = T)
+```
+
+Calculate surprisal and visualise as beanplots.
+
+```{r Mclust3D_surprisal, fig.width = 6, fig.asp = 2/3}
+# Density - Surprisal
+a <- lapply( IRN.NG, function(x) {-log(predict(xyzMc.density, newdata=predictPCA(pcEdge0i, x[,])))})
+par(mar=c(4,4,.5,.5))
+beanplot(a, what=c(F,T,F,F), cutmin=0, cutmax=40, ylim=c(5.5,28), log='y', las=2, bw=0.05, maxwidth = 1, border=NA, ylab='-log(p[x,y,z])')
+```
+
+
+Classification of points using Gaussian Mixture Model.
+
+```{r Mclust3D_classification, eval=FALSE}
+# Classification
+xyzDA   <- MclustDA(pcEdge0i$x[,1:3], xyzMc$classification, G=4, modelNames='VVV')
+xyzDAcv <- cvMclustDA(xyzDA, nfold=10)
+
+pcEdge0i.classification <- do.call(cbind, lapply(IRN.NG, function(x){table(predict(xyzDA, newdata=predictPCA(pcEdge0i, x))$classification)}))
+
+# which cells are classified correctly?
+pcEdge0i.classification.retained <- lapply(IRN.NG, function(x){rejectOption(xyzMc, predictPCA(pcEdge0i, x), G=1:4, alpha=0.1) })
+```
+
+Include reject-option (discard points that fall outside of a given percentile threshold).
+
+```{r function_rejectOption}
+#####  function to reject points outside interval of any of the gaussian components
+rejectOption <- function(gmModel, testData, G, alpha) {
+# for each multivariate gaussian component calculate the F-value to compare against the quantile function
+# and check against the chi-square distribution.
+  d = ncol(testData)
+  I = apply(gmModel$parameters$variance$sigma, 3, solve)
+  # calculate chi-square statistic     
+  chiStat <- apply(testData, 1, function(x) { sapply(G, function(g) {
+                                              t(x - gmModel$parameters$mean[,g]) %*%
+                                                               matrix(I[,g], d)  %*%
+                                               (x - gmModel$parameters$mean[,g]) } ) } )
+  # check if chi-square statistic is larger (smaller) than corresponding quantile at the level of alpha (1-alpha)
+  retained = chiStat < qchisq(1-alpha, df=d)
+  # if G comprises multiple components (e.g. G=1:4), check whether cells are members of ANY component and return single logical vector
+  if (length(G)>1) {
+    retained = apply(retained, 2, any)
+  }
+  return(retained)
+}
+```
+
+Illustrate percentiles of Gaussian components at PC3=0.
+
+```{r Mclust3D_classification_percentile, fig.width = 4, fig.asp = 1}
+# visualise the interval in 2D for z=0
+xyzPlane <- cbind(as.vector(matrix(rep(seq(-20,20,0.1), 201), ncol = 401, byrow=T)), as.vector(matrix(rep(seq(-10,10, 0.1), 401), ncol = 201, byrow=F)), 0)
+colnames(xyzPlane) <- c('x','y','z')
+
+# plot an example - 90th percentile
+par(mar=c(4,4,.5,.5))
+# G=1
+  a <- rejectOption(xyzMc, xyzPlane, G=1, alpha=0.1) 
+  z <- matrix(a, 201)
+  image(x=seq(-20,20,0.1), y=seq(-10,10,0.1), z=t(z), col=c(NA, '#1f78b466'), las=1, xlab='PC1', ylab='PC2')
+# G=2
+  a <- rejectOption(xyzMc, xyzPlane, G=2, alpha=0.05)
+  z <- matrix(a, 201)
+  image(x=seq(-20,20,0.1), y=seq(-10,10,0.1), z=t(z), col=c(NA, '#33a02c66'), add=T, axes=F)
+# G=3
+  a <- rejectOption(xyzMc, xyzPlane, G=3, alpha=0.05)
+  z <- matrix(a, 201)
+  image(x=seq(-20,20,0.1), y=seq(-10,10,0.1), z=t(z), col=c(NA, '#6a3d9a66'), add=T, axes=F)
+# data points
+  points(pcEdge0i$x[,1:2], pch='.', col='black')
+  text(-12,9, labels='90th percentile')
+```
+
+Classify cells across entire reprogramming time-course.
+
+```{r Mclust3D_classification_timecourse}
+# Include reject option in classification
+gmmClassification <- function(testData, gmModel, gmDA, pcaModel, tab=TRUE){
+  a=predictPCA(pcaModel, testData)
+  b=factor(predict(gmDA, newdata=a)$classification, levels=1:5)
+  c=rejectOption(gmModel, a, G=1:4, alpha=0.25)
+  b[!c]<-5
+  if (tab){ return(table(b))
+   } else { return(b) }
+}
+pcEdge0i.classification <- do.call(cbind, lapply(IRN.NG, gmmClassification, xyzMc, xyzDA, pcEdge0i ))
+```
+
+Visualise results as bar chart.
+
+```{r Mclust3D_classification_timecourse_VIZ, fig.width = 6, fig.asp = 2/3}
+# Viz timecourse classification results
+par(mar=c(4,4,.5,.5))
+barplot(t(t(pcEdge0i.classification) / colSums(pcEdge0i.classification)), las=2, 
+        ylab='Fraction', col=c('#6a3d9a', '#1f78b4', '#33a02c', '#ff7f00', '#FFFFFF'))
+```
